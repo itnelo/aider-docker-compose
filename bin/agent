@@ -1,0 +1,635 @@
+#!/usr/bin/env bash
+#
+# Wrapper around `docker compose run` for the `agent` service (encapsulates compose flags and Aider CLI).
+#
+# Raw equivalent (from repo root, after `cp .env-template .env` and `cp docker-compose.dev.yml.dist docker-compose.yml`):
+#   docker compose run --rm --workdir /workspaces/default/demo agent \
+#     --model "${AIDER_OLLAMA_PROVIDER}/${AIDER_OLLAMA_MODEL}" \
+#     --yes --restore-chat-history \
+#     --message "Update README.md: add a second line." \
+#     /workspaces/default/demo
+# For a one-off run without loading prior chat for the same repo path, use `bin/agent --no-previous-context …`
+# (the wrapper omits `--restore-chat-history`; sidecar paths for new log lines are unchanged).
+#
+# Optional: control commits on raw `docker compose run` via `.env` / `AIDER_AUTO_COMMITS` or CLI, e.g.:
+#   docker compose run --rm --workdir /workspaces/default/demo agent \
+#     --model "ollama_chat/your-model" --yes --no-auto-commits --message "..." /workspaces/default/demo
+#
+# This wrapper defaults to NO auto-commits per run (`-e AIDER_AUTO_COMMITS=false`) unless you pass `--commit`,
+# which forces `-e AIDER_AUTO_COMMITS=true` for that run (overrides `.env` including "never commit").
+# By default the wrapper passes Aider `--restore-chat-history` so the same host repo path reuses chat sidecar files;
+# pass `--no-previous-context` to omit that flag for this run (no restored prior conversation in Aider's sense).
+# Same idea: `--thinking` ensures a positive thinking-token budget for this run when `.env` has 0 (see script constant).
+# Aider applies thinking_tokens only for models that support it; otherwise it ignores the flag (see `.env-template`).
+# Without `--debug`, merged stdout/stderr drop compose/Aider startup lines; unless `--thinking`, a best-effort
+# THINKING…ANSWER / redacted_thinking strip runs on the rest (see awk). With `--debug`, raw `exec` (no filter).
+# Hidden flag (not in --help): `--debug`.
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+COMPOSE_FILE="$REPO_ROOT/docker-compose.yml"
+ENV_FILE="$REPO_ROOT/.env"
+# Bind-mount target inside the container for ad-hoc host dirs outside AIDER_WORKSPACES_PATH.
+ONE_SHOT_CONTAINER_PATH="/repo"
+# Default if AIDER_WORKSPACES_PATH / AIDER_HOME_PATH are absent from .env (matches .env-template).
+DEFAULT_WORKSPACES_REL="./data/agent/workspaces"
+DEFAULT_HOME_REL="./data/agent/app"
+# When `bin/agent --thinking` and .env has AIDER_THINKING_TOKENS=0 (or invalid), use this budget for one run.
+# Aider may ignore thinking_tokens for some models; `--thinking` also disables THINKING-strip on stdout (see awk).
+AGENT_THINKING_TOKENS_RUN_DEFAULT=8192
+
+usage() {
+  cat <<'EOF' >&2
+Usage: agent [options] --workdir <path> <prompt...>
+
+Options:
+  --workdir <path>   Git repo root: host path, or container path /workspaces/... (see AIDER_WORKSPACES_PATH in .env).
+  --model <id>       Main model override (default: AIDER_OLLAMA_PROVIDER + / + AIDER_OLLAMA_MODEL from .env).
+  --commit           Enable Aider auto-commits for this run only (forces AIDER_AUTO_COMMITS=true; overrides .env).
+  --thinking         Show model thinking / reasoning in the UI for this run if AIDER_THINKING_TOKENS is 0 in .env
+                     (sets a positive budget for this run only; if .env already has a positive value, it is kept).
+                     No-op if Aider does not support thinking_tokens for that model (e.g. many ollama_chat GGUF).
+                     Also leaves THINKING…ANSWER-style blocks in stdout (without this flag, the wrapper strips them when not in --debug).
+  --no-previous-context   Omit Aider --restore-chat-history for this run (do not load prior chat for the same repo
+                     path; sidecar AIDER_*_HISTORY_FILE paths are still set so this run can append logs there).
+  -h, --help         Show this help.
+
+Default without --commit: no auto-commit for this run (AIDER_AUTO_COMMITS=false; overrides .env). Raw
+`docker compose run ... agent` does not apply this; it follows .env.
+
+Required: --workdir and at least one positional prompt word after options.
+
+Without `--debug`, this script merges stderr into stdout, drops common `docker compose run` / Aider startup lines, and
+unless `--thinking` is set, drops a best-effort THINKING…ANSWER banner (and related redacted / template noise) from the
+model transcript. With `--thinking`, that transcript strip is off; everything else is printed as-is.
+
+Examples:
+  agent --workdir /workspaces/default/demo "Update README.md: one line."
+  agent --workdir ./data/agent/workspaces/default/demo "Same repo via host path under AIDER_WORKSPACES_PATH."
+  agent --model ollama_chat/my-model --workdir ./data/agent/workspaces/default/demo "Override main model."
+  agent --commit --workdir ./data/agent/workspaces/default/demo "Enable auto-commit for this run."
+  agent --model ollama_chat/my-model --commit --workdir ./data/agent/workspaces/default/demo "Model + commit."
+  agent --thinking --workdir ./data/agent/workspaces/default/demo "One run with thinking UI despite AIDER_THINKING_TOKENS=0."
+  agent --no-previous-context --workdir ./data/agent/workspaces/default/demo "Same repo, fresh Aider context this run."
+EOF
+}
+
+read_env_value() {
+  # Read first KEY= line from .env (no shell sourcing).
+  local key="$1"
+  local file="$2"
+  local val
+  val="$(sed -n "s/^${key}=//p" "${file}" 2>/dev/null | head -n1)"
+  val="${val%%$'\r'}"
+  if [[ "${val}" =~ ^\".*\"$ ]]; then
+    val="${val:1:${#val}-2}"
+  elif [[ "${val}" =~ ^\'.*\'$ ]]; then
+    val="${val:1:${#val}-2}"
+  fi
+  printf '%s' "${val}"
+}
+
+dlog() {
+  if [[ "${DEBUG}" -eq 1 ]]; then
+    printf '[agent:debug] %s\n' "$*" >&2
+  fi
+}
+
+emit_quoted_cmd() {
+  local first=1 a
+  for a in "$@"; do
+    if (( first )); then
+      first=0
+    else
+      printf ' '
+    fi
+    printf '%q' "$a"
+  done
+  printf '\n'
+}
+
+# Drop compose/Aider startup lines. If strip_thinking=1, also drop THINKING…ANSWER (best-effort) and related blocks.
+# After preamble: skip leading blank-only lines and strip leading whitespace on the first line actually printed.
+agent_filter_compose_aider_output() {
+  local strip_thinking="${1:-0}"
+  awk -v strip_thinking="${strip_thinking}" -f <(cat <<'AWKEOF'
+function is_preamble_line(l) {
+  if (l ~ /^[[:space:]]*Container /) return 1
+  if (l ~ /^[[:space:]]*Generated \/app\/\.aider\.model\.settings\.yml/) return 1
+  if (l ~ /^[[:space:]]*Analytics have been permanently disabled/) return 1
+  if (l ~ /^[[:space:]]*Use --no-check-model-accepts-settings/) return 1
+  if (l ~ /^[[:space:]]*Aider v/) return 1
+  if (l ~ /^[[:space:]]*Weak model:/) return 1
+  if (l ~ /^[[:space:]]*Main model:.*with whole edit format/) return 1
+  if (l ~ /^[[:space:]]*Model:.*with whole edit format/) return 1
+  if (l ~ /^[[:space:]]*Git repo: /) return 1
+  if (l ~ /^[[:space:]]*Repo-map: /) return 1
+  if (l ~ /^[[:space:]]*Restored previous conversation history/) return 1
+  if (l ~ /^[[:space:]]*Added \.aider\* to \.gitignore/) return 1
+  if (l ~ /^[[:space:]]*Git repository created in /) return 1
+  if (l ~ /^[[:space:]]*Update git name with:/) return 1
+  if (l ~ /^[[:space:]]*Update git email with:/) return 1
+  return 0
+}
+function is_thinking_header(l) {
+  if (l ~ /\*\*ANSWER\*\*/) return 0
+  if (l ~ /\*\*THINKING\*\*/) return 1
+  if (l ~ /THINKING/ && l ~ /[►>▶]/) return 1
+  return 0
+}
+function is_answer_header(l) {
+  if (l ~ /\*\*ANSWER\*\*/) return 1
+  if (l ~ /ANSWER/ && l ~ /[►>▶]/) return 1
+  return 0
+}
+function is_dash_separator(l,   t) {
+  t = l
+  gsub(/\r/, "", t)
+  gsub(/^[[:space:]]+|[[:space:]]+$/, "", t)
+  return (length(t) >= 10 && t ~ /^[-─═_]+$/)
+}
+BEGIN {
+  pre = 1
+  skip_warn = 0
+  skip_model = 0
+  thinking = 0
+  pending_dash = ""
+  in_redacted = 0
+  skip_until_tokens = 0
+  output_started = 0
+}
+{
+  gsub(/\r/, "", $0)
+  if (pre) {
+    if (skip_warn) {
+      if ($0 ~ /^[[:space:]]*Use --no-check-model-accepts-settings/) skip_warn = 0
+      next
+    }
+    if (skip_model) {
+      if ($0 ~ /with whole edit format/) skip_model = 0
+      next
+    }
+    if ($0 ~ /^[[:space:]]*Warning:/) {
+      skip_warn = ($0 !~ /Use --no-check-model-accepts-settings/)
+      next
+    }
+    if ($0 ~ /^[[:space:]]*(Model|Main model):/ && $0 !~ /with whole edit format/) {
+      skip_model = 1
+      next
+    }
+    if (is_preamble_line($0)) next
+    if ($0 ~ /^[[:space:]]*$/) next
+    pre = 0
+  }
+  if (!pre && !output_started && $0 ~ /^[[:space:]]*$/) next
+  if (strip_thinking == 1 && $0 ~ /<[|]im_start[|]>assistant/) next
+  if (strip_thinking == 1 && in_redacted) {
+    if ($0 ~ /<\/redacted_thinking>/) {
+      in_redacted = 0
+      skip_until_tokens = 1
+    }
+    next
+  }
+  if (strip_thinking == 1 && $0 ~ /<think>/) {
+    in_redacted = 1
+    if ($0 ~ /<\/redacted_thinking>/) {
+      in_redacted = 0
+      skip_until_tokens = 1
+    }
+    next
+  }
+  if (strip_thinking == 1 && skip_until_tokens) {
+    if (tolower($0) ~ /^[[:space:]]*tokens[[:space:]]*:/) skip_until_tokens = 0
+    else next
+  }
+  if (strip_thinking == 1 && thinking) {
+    if (is_answer_header($0)) {
+      thinking = 0
+      next
+    }
+    next
+  }
+  if (strip_thinking == 1 && pending_dash != "") {
+    if (is_thinking_header($0)) {
+      pending_dash = ""
+      thinking = 1
+      next
+    }
+    if (!output_started) {
+      sub(/^[[:space:]]+/, "", pending_dash)
+      if (pending_dash ~ /^[[:space:]]*$/) {
+        pending_dash = ""
+        next
+      }
+    }
+    print pending_dash
+    fflush()
+    pending_dash = ""
+    output_started = 1
+  }
+  if (strip_thinking == 1 && $0 != "" && is_dash_separator($0)) {
+    pending_dash = $0
+    next
+  }
+  if (strip_thinking == 1 && is_thinking_header($0)) {
+    thinking = 1
+    next
+  }
+  if (!output_started) {
+    sub(/^[[:space:]]+/, "", $0)
+    if ($0 ~ /^[[:space:]]*$/) next
+  }
+  print
+  fflush()
+  output_started = 1
+}
+END {
+  if (pending_dash != "") {
+    if (!output_started) {
+      sub(/^[[:space:]]+/, "", pending_dash)
+      if (pending_dash ~ /^[[:space:]]*$/) pending_dash = ""
+    }
+    if (pending_dash != "") {
+      print pending_dash
+      fflush()
+    }
+  }
+}
+AWKEOF
+)
+}
+
+DEBUG=0
+DO_COMMIT=0
+DO_THINKING=0
+DO_NO_PREVIOUS_CONTEXT=0
+WORKDIR_ARG=""
+MODEL_OVERRIDE=""
+POSITIONAL=()
+VOLUME_ARGS=()
+TARGET_IN_CONTAINER=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --debug)
+      DEBUG=1
+      shift
+      ;;
+    --commit)
+      DO_COMMIT=1
+      shift
+      ;;
+    --thinking)
+      DO_THINKING=1
+      shift
+      ;;
+    --no-previous-context)
+      DO_NO_PREVIOUS_CONTEXT=1
+      shift
+      ;;
+    --workdir)
+      if [[ $# -lt 2 ]]; then
+        echo "Error: --workdir requires a value." >&2
+        usage
+        exit 1
+      fi
+      WORKDIR_ARG="$2"
+      shift 2
+      ;;
+    --model)
+      if [[ $# -lt 2 ]]; then
+        echo "Error: --model requires a value." >&2
+        usage
+        exit 1
+      fi
+      MODEL_OVERRIDE="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      POSITIONAL+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "${WORKDIR_ARG}" ]]; then
+  usage
+  exit 1
+fi
+
+if [[ ${#POSITIONAL[@]} -eq 0 ]]; then
+  usage
+  exit 1
+fi
+
+PROMPT="${POSITIONAL[*]}"
+if [[ ! -f "${COMPOSE_FILE}" ]]; then
+  echo "Error: compose file not found: ${COMPOSE_FILE}" >&2
+  exit 1
+fi
+
+if ! command -v realpath >/dev/null 2>&1; then
+  echo "Error: realpath is required (usually from coreutils)." >&2
+  exit 1
+fi
+
+if [[ "${DEBUG}" -eq 1 ]]; then
+  dlog "debug mode (--debug)"
+  dlog "REPO_ROOT=${REPO_ROOT}"
+  dlog "COMPOSE_FILE=${COMPOSE_FILE}"
+  dlog "ENV_FILE=${ENV_FILE}"
+  dlog "raw --workdir: $(printf '%q' "${WORKDIR_ARG}")"
+  dlog "prompt (positional): $(printf '%q' "${PROMPT}")"
+fi
+
+# Host workspace root: path mapping and stable hash for Aider metadata sidecar.
+ws_raw="${DEFAULT_WORKSPACES_REL}"
+if [[ -f "${ENV_FILE}" ]]; then
+  from_env_ws="$(read_env_value AIDER_WORKSPACES_PATH "${ENV_FILE}" || true)"
+  if [[ -n "${from_env_ws}" ]]; then
+    ws_raw="${from_env_ws}"
+  fi
+fi
+dlog "AIDER_WORKSPACES_PATH (raw from .env or default): $(printf '%q' "${ws_raw}")"
+
+workspace_root=""
+if [[ "${ws_raw}" == /* ]]; then
+  workspace_root="$(realpath "${ws_raw}" 2>/dev/null)" || workspace_root=""
+else
+  workspace_root="$(cd "${REPO_ROOT}" && realpath "${ws_raw}" 2>/dev/null)" || workspace_root=""
+fi
+if [[ -n "${workspace_root}" ]]; then
+  dlog "resolved workspace root on host: $(printf '%q' "${workspace_root}")"
+else
+  dlog "workspace root could not be resolved (missing dir or bad path); /workspaces mapping unavailable"
+fi
+
+HOST_REPO_CANONICAL=""
+resolved=""
+
+# Resolve --workdir: container /workspaces/... vs host path.
+case "${WORKDIR_ARG}" in
+  /workspaces|/workspaces/*)
+    TARGET_IN_CONTAINER="${WORKDIR_ARG}"
+    if [[ -n "${workspace_root}" ]]; then
+      ws_suffix="${WORKDIR_ARG#/workspaces}"
+      ws_suffix="${ws_suffix#/}"
+      if [[ -z "${ws_suffix}" ]]; then
+        HOST_REPO_CANONICAL="$(realpath "${workspace_root}" 2>/dev/null || printf '%s' "${workspace_root}")"
+      else
+        HOST_REPO_CANONICAL="$(realpath "${workspace_root}/${ws_suffix}" 2>/dev/null || printf '%s' "${workspace_root}/${ws_suffix}")"
+      fi
+    else
+      HOST_REPO_CANONICAL="${WORKDIR_ARG}"
+    fi
+    dlog "treat as container path (/workspaces); no extra bind volume"
+    dlog "TARGET_IN_CONTAINER=${TARGET_IN_CONTAINER}"
+    dlog "canonical host repo path (metadata hash): $(printf '%q' "${HOST_REPO_CANONICAL}")"
+    ;;
+  *)
+    resolved="$(realpath "${WORKDIR_ARG}")" || {
+      echo "Error: cannot resolve path (not a directory?): ${WORKDIR_ARG}" >&2
+      exit 1
+    }
+    if [[ ! -d "${resolved}" ]]; then
+      echo "Error: not a directory: ${WORKDIR_ARG}" >&2
+      exit 1
+    fi
+    HOST_REPO_CANONICAL="${resolved}"
+    dlog "realpath(--workdir)=$(printf '%q' "${resolved}")"
+
+    if [[ -n "${workspace_root}" ]]; then
+      case "${resolved}" in
+        "${workspace_root}")
+          TARGET_IN_CONTAINER="/workspaces"
+          dlog "host path equals workspace root -> /workspaces in container; no extra volume"
+          ;;
+        "${workspace_root}"/*)
+          prefix="${workspace_root}/"
+          rel="${resolved#"${prefix}"}"
+          TARGET_IN_CONTAINER="/workspaces/${rel}"
+          dlog "host path under workspace -> $(printf '%q' "${TARGET_IN_CONTAINER}"); no extra volume"
+          dlog "suffix under workspace root: $(printf '%q' "${rel}")"
+          ;;
+        *)
+          VOLUME_ARGS=(-v "${resolved}:${ONE_SHOT_CONTAINER_PATH}:rw")
+          TARGET_IN_CONTAINER="${ONE_SHOT_CONTAINER_PATH}"
+          dlog "host path outside workspace -> one-shot bind: $(printf '%q' "${resolved}") -> ${ONE_SHOT_CONTAINER_PATH}"
+          ;;
+      esac
+    else
+      VOLUME_ARGS=(-v "${resolved}:${ONE_SHOT_CONTAINER_PATH}:rw")
+      TARGET_IN_CONTAINER="${ONE_SHOT_CONTAINER_PATH}"
+      dlog "one-shot bind (workspace root unresolved): $(printf '%q' "${resolved}") -> ${ONE_SHOT_CONTAINER_PATH}"
+    fi
+    dlog "TARGET_IN_CONTAINER=$(printf '%q' "${TARGET_IN_CONTAINER}")"
+    dlog "canonical host repo path (metadata): $(printf '%q' "${HOST_REPO_CANONICAL}")"
+    if [[ ${#VOLUME_ARGS[@]} -gt 0 ]]; then
+      dlog "extra compose volume args: $(printf '%q' "${VOLUME_ARGS[@]}")"
+    else
+      dlog "extra compose volume args: (none)"
+    fi
+    ;;
+esac
+
+# Aider chat/input/LLM logs default into the git repo; redirect to container HOME (/app -> AIDER_HOME_PATH on host).
+# .aider.tags.cache* may still appear in the repo (upstream limitation).
+META_HASH="$(printf '%s' "${HOST_REPO_CANONICAL}" | sha256sum | awk '{print $1}')"
+home_raw="${DEFAULT_HOME_REL}"
+if [[ -f "${ENV_FILE}" ]]; then
+  from_env_home="$(read_env_value AIDER_HOME_PATH "${ENV_FILE}" || true)"
+  if [[ -n "${from_env_home}" ]]; then
+    home_raw="${from_env_home}"
+  fi
+fi
+if [[ "${home_raw}" == /* ]]; then
+  home_host_abs="$(realpath "${home_raw}" 2>/dev/null)" || home_host_abs=""
+else
+  home_host_abs="$(cd "${REPO_ROOT}" && realpath "${home_raw}" 2>/dev/null)" || home_host_abs=""
+fi
+if [[ -z "${home_host_abs}" ]]; then
+  echo "Error: cannot resolve AIDER_HOME_PATH (${home_raw}); check .env." >&2
+  exit 1
+fi
+SIDECAR_HOST="${home_host_abs}/.aider-sidecar/${META_HASH}"
+mkdir -p "${SIDECAR_HOST}"
+AIDER_CHAT_CONTAINER="/app/.aider-sidecar/${META_HASH}/chat.history.md"
+AIDER_INPUT_CONTAINER="/app/.aider-sidecar/${META_HASH}/input.history"
+AIDER_LLM_CONTAINER="/app/.aider-sidecar/${META_HASH}/llm.history"
+dlog "Aider metadata sidecar on host $(printf '%q' "${SIDECAR_HOST}") -> /app/.aider-sidecar/${META_HASH}/ in container"
+
+MODEL=""
+if [[ -n "${MODEL_OVERRIDE}" ]]; then
+  MODEL="${MODEL_OVERRIDE}"
+  dlog "model: from --model -> $(printf '%q' "${MODEL}")"
+else
+  if [[ ! -f "${ENV_FILE}" ]]; then
+    echo "Error: ${ENV_FILE} not found. Set --model <provider/model>." >&2
+    exit 1
+  fi
+  PROVIDER="$(read_env_value AIDER_OLLAMA_PROVIDER "${ENV_FILE}" || true)"
+  OLLAMA_MODEL="$(read_env_value AIDER_OLLAMA_MODEL "${ENV_FILE}" || true)"
+  if [[ -z "${PROVIDER}" || -z "${OLLAMA_MODEL}" ]]; then
+    echo "Error: ${ENV_FILE} must define AIDER_OLLAMA_PROVIDER and AIDER_OLLAMA_MODEL, or pass --model." >&2
+    exit 1
+  fi
+  MODEL="${PROVIDER}/${OLLAMA_MODEL}"
+  dlog "model: from .env AIDER_OLLAMA_PROVIDER + AIDER_OLLAMA_MODEL -> $(printf '%q' "${MODEL}")"
+fi
+
+# Explicit -e + matching CLI flags for stream/fancy/pretty/notifications (compose already sets them; this
+# mirrors .env in --debug and forces CLI switches). We always pass --thinking-tokens for parity; Aider ignores it
+# when the model does not support that setting (e.g. many ollama_chat GGUF). Assistant output may still contain
+# THINKING/ANSWER blocks emitted as normal completion tokens.
+STREAM_VAL="false"
+if [[ -f "${ENV_FILE}" ]]; then
+  s_stream="$(read_env_value AIDER_STREAM "${ENV_FILE}" || true)"
+  if [[ -n "${s_stream}" ]]; then
+    STREAM_VAL="${s_stream}"
+  fi
+fi
+STREAM_LC="$(printf '%s' "${STREAM_VAL}" | tr '[:upper:]' '[:lower:]')"
+STREAM_FLAG=()
+if [[ "${STREAM_LC}" == "true" || "${STREAM_LC}" == "1" || "${STREAM_LC}" == "yes" ]]; then
+  :
+else
+  STREAM_FLAG=(--no-stream)
+fi
+if [[ "${#STREAM_FLAG[@]}" -gt 0 ]]; then
+  dlog "AIDER_STREAM=${STREAM_VAL} (passing --no-stream)"
+else
+  dlog "AIDER_STREAM=${STREAM_VAL} (no --no-stream)"
+fi
+
+FANCY_VAL="false"
+if [[ -f "${ENV_FILE}" ]]; then
+  s_fancy="$(read_env_value AIDER_FANCY_INPUT "${ENV_FILE}" || true)"
+  if [[ -n "${s_fancy}" ]]; then
+    FANCY_VAL="${s_fancy}"
+  fi
+fi
+FANCY_LC="$(printf '%s' "${FANCY_VAL}" | tr '[:upper:]' '[:lower:]')"
+FANCY_FLAG=()
+if [[ "${FANCY_LC}" == "true" || "${FANCY_LC}" == "1" || "${FANCY_LC}" == "yes" ]]; then
+  :
+else
+  FANCY_FLAG=(--no-fancy-input)
+fi
+if [[ "${#FANCY_FLAG[@]}" -gt 0 ]]; then
+  dlog "AIDER_FANCY_INPUT=${FANCY_VAL} (passing --no-fancy-input)"
+else
+  dlog "AIDER_FANCY_INPUT=${FANCY_VAL} (no --no-fancy-input)"
+fi
+
+PRETTY_VAL="false"
+if [[ -f "${ENV_FILE}" ]]; then
+  s_pretty="$(read_env_value AIDER_PRETTY "${ENV_FILE}" || true)"
+  if [[ -n "${s_pretty}" ]]; then
+    PRETTY_VAL="${s_pretty}"
+  fi
+fi
+PRETTY_LC="$(printf '%s' "${PRETTY_VAL}" | tr '[:upper:]' '[:lower:]')"
+PRETTY_FLAG=()
+if [[ "${PRETTY_LC}" == "true" || "${PRETTY_LC}" == "1" || "${PRETTY_LC}" == "yes" ]]; then
+  :
+else
+  PRETTY_FLAG=(--no-pretty)
+fi
+if [[ "${#PRETTY_FLAG[@]}" -gt 0 ]]; then
+  dlog "AIDER_PRETTY=${PRETTY_VAL} (passing --no-pretty)"
+else
+  dlog "AIDER_PRETTY=${PRETTY_VAL} (no --no-pretty)"
+fi
+
+NOTIFY_VAL="false"
+if [[ -f "${ENV_FILE}" ]]; then
+  s_notify="$(read_env_value AIDER_NOTIFICATIONS "${ENV_FILE}" || true)"
+  if [[ -n "${s_notify}" ]]; then
+    NOTIFY_VAL="${s_notify}"
+  fi
+fi
+NOTIFY_LC="$(printf '%s' "${NOTIFY_VAL}" | tr '[:upper:]' '[:lower:]')"
+NOTIFY_FLAG=()
+if [[ "${NOTIFY_LC}" == "true" || "${NOTIFY_LC}" == "1" || "${NOTIFY_LC}" == "yes" ]]; then
+  :
+else
+  NOTIFY_FLAG=(--no-notifications)
+fi
+if [[ "${#NOTIFY_FLAG[@]}" -gt 0 ]]; then
+  dlog "AIDER_NOTIFICATIONS=${NOTIFY_VAL} (passing --no-notifications)"
+else
+  dlog "AIDER_NOTIFICATIONS=${NOTIFY_VAL} (no --no-notifications)"
+fi
+
+# Thinking token budget for Aider (--thinking-tokens / AIDER_THINKING_TOKENS). If Aider logs that the model does not
+# support thinking_tokens, these values have no effect; verbose THINKING/ANSWER lines may still be the model's text.
+THINKING_VAL="0"
+if [[ -f "${ENV_FILE}" ]]; then
+  s_think="$(read_env_value AIDER_THINKING_TOKENS "${ENV_FILE}" || true)"
+  if [[ -n "${s_think}" ]]; then
+    THINKING_VAL="${s_think}"
+  fi
+fi
+if [[ "${DO_THINKING}" -eq 1 ]]; then
+  if [[ "${THINKING_VAL}" =~ ^[1-9][0-9]*$ ]]; then
+    dlog "thinking: --thinking and AIDER_THINKING_TOKENS=${THINKING_VAL} from .env (unchanged)"
+  else
+    THINKING_VAL="${AGENT_THINKING_TOKENS_RUN_DEFAULT}"
+    dlog "thinking: --thinking forces AIDER_THINKING_TOKENS=${THINKING_VAL} for this run (was 0 or non-numeric in .env)"
+  fi
+fi
+THINKING_FLAG=(--thinking-tokens "${THINKING_VAL}")
+dlog "AIDER_THINKING_TOKENS=${THINKING_VAL} (passing ${THINKING_FLAG[*]})"
+
+cd "${REPO_ROOT}"
+dlog "before run: cwd=$(pwd)"
+
+RESTORE_CHAT_FLAG=(--restore-chat-history)
+if [[ "${DO_NO_PREVIOUS_CONTEXT}" -eq 1 ]]; then
+  RESTORE_CHAT_FLAG=()
+  dlog "chat: omitting --restore-chat-history (--no-previous-context); AIDER_*_HISTORY_FILE sidecar paths unchanged"
+fi
+
+# Compose sets agent working_dir to /workspaces/${AIDER_WORKSPACE_DEFAULT}; without override, Aider --message
+# would bind the git repo to that cwd. Force container cwd to the target repo for this run.
+RUN_CMD=(
+  docker compose -f "${COMPOSE_FILE}" run --rm
+  --workdir "${TARGET_IN_CONTAINER}"
+  -e "AIDER_STREAM=${STREAM_VAL}"
+  -e "AIDER_FANCY_INPUT=${FANCY_VAL}"
+  -e "AIDER_PRETTY=${PRETTY_VAL}"
+  -e "AIDER_NOTIFICATIONS=${NOTIFY_VAL}"
+  -e "AIDER_THINKING_TOKENS=${THINKING_VAL}"
+  -e "AIDER_CHAT_HISTORY_FILE=${AIDER_CHAT_CONTAINER}"
+  -e "AIDER_INPUT_HISTORY_FILE=${AIDER_INPUT_CONTAINER}"
+  -e "AIDER_LLM_HISTORY_FILE=${AIDER_LLM_CONTAINER}"
+)
+if [[ "${DO_COMMIT}" -eq 1 ]]; then
+  RUN_CMD+=(-e "AIDER_AUTO_COMMITS=true")
+  dlog "commits: forced on (--commit, AIDER_AUTO_COMMITS=true for this run)"
+else
+  RUN_CMD+=(-e "AIDER_AUTO_COMMITS=false")
+  dlog "commits: forced off for this run (AIDER_AUTO_COMMITS=false), overrides .env"
+fi
+RUN_CMD+=("${VOLUME_ARGS[@]}")
+RUN_CMD+=(agent "${RESTORE_CHAT_FLAG[@]}" "${STREAM_FLAG[@]}" "${FANCY_FLAG[@]}" "${PRETTY_FLAG[@]}" "${NOTIFY_FLAG[@]}" "${THINKING_FLAG[@]}" --model "${MODEL}" --yes --message "${PROMPT}" "${TARGET_IN_CONTAINER}")
+
+if [[ "${DEBUG}" -eq 1 ]]; then
+  dlog "docker compose run: container --workdir -> $(printf '%q' "${TARGET_IN_CONTAINER}") (Aider repo root)"
+  printf '[agent:debug] full docker compose command line (after resolution):\n' >&2
+  emit_quoted_cmd "${RUN_CMD[@]}" >&2
+  exec "${RUN_CMD[@]}"
+fi
+
+strip_thinking_block=0
+[[ "${DO_THINKING}" -eq 0 ]] && strip_thinking_block=1
+
+if command -v stdbuf >/dev/null 2>&1; then
+  stdbuf -oL -eL "${RUN_CMD[@]}" 2>&1 | agent_filter_compose_aider_output "${strip_thinking_block}"
+else
+  "${RUN_CMD[@]}" 2>&1 | agent_filter_compose_aider_output "${strip_thinking_block}"
+fi
+exit "${PIPESTATUS[0]}"

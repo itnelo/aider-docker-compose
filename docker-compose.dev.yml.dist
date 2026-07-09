@@ -1,0 +1,93 @@
+
+services:
+#  ssh-tunnel-ollama:
+#    build:
+#      context: ./docker/dev/ssh-tunnel-ollama
+#    container_name: ai-ssh-tunnel-ollama
+#    restart: unless-stopped
+#    networks:
+#        frontend:
+#            ipv4_address: 172.20.10.1
+#    environment:
+#      LOCAL_HOST: ${SSH_TUNNEL_OLLAMA_LOCAL_HOST}
+#      LOCAL_PORT: ${SSH_TUNNEL_OLLAMA_LOCAL_PORT}
+#      REMOTE_HOST: ${SSH_TUNNEL_OLLAMA_REMOTE_HOST}
+#      REMOTE_PORT: ${SSH_TUNNEL_OLLAMA_REMOTE_PORT}
+#      SSH_TUNNEL_HOST: ${SSH_TUNNEL_OLLAMA_SSH_TUNNEL_HOST}
+#      SSH_TUNNEL_PORT: ${SSH_TUNNEL_OLLAMA_SSH_TUNNEL_PORT}
+#      SSH_TUNNEL_USER: ${SSH_TUNNEL_OLLAMA_SSH_TUNNEL_USER}
+#    volumes:
+#      - ${SSH_TUNNEL_OLLAMA_SSH_KEY_PATH}:/root/ssh-import/id_rsa:ro
+
+  agent:
+    build:
+      context: ./docker/dev/agent
+      args:
+        AIDER_VERSION: ${AIDER_VERSION}
+    container_name: ai-agent
+    user: "${HOST_UID}:${HOST_GID}"
+    working_dir: /workspaces/${AIDER_WORKSPACE_DEFAULT}
+    networks:
+        frontend:
+            ipv4_address: 172.20.20.1
+    environment:
+      TZ: ${TIMEZONE}
+      # This is where Aider will write `.aider*` files by default.
+      HOME: /app
+
+      # Git reads `GIT_*` on commit; `.env` uses `AIDER_GIT_*` (see `.env-template`).
+      GIT_AUTHOR_NAME: ${AIDER_GIT_AUTHOR_NAME}
+      GIT_AUTHOR_EMAIL: ${AIDER_GIT_AUTHOR_EMAIL}
+      GIT_COMMITTER_NAME: ${AIDER_GIT_COMMITTER_NAME}
+      GIT_COMMITTER_EMAIL: ${AIDER_GIT_COMMITTER_EMAIL}
+
+      # Ollama connectivity for Aider.
+      OLLAMA_API_BASE: ${AIDER_OLLAMA_API_BASE}
+      OLLAMA_API_KEY: ${AIDER_OLLAMA_API_KEY}
+
+      # Aider flags.
+      AIDER_ARCHITECT: ${AIDER_ARCHITECT}
+      AIDER_AUTO_ACCEPT_ARCHITECT: ${AIDER_AUTO_ACCEPT_ARCHITECT}
+      AIDER_WEAK_MODEL: ${AIDER_WEAK_MODEL}
+      AIDER_EDITOR_MODEL: ${AIDER_EDITOR_MODEL}
+      AIDER_ATTRIBUTE_CO_AUTHORED_BY: ${AIDER_ATTRIBUTE_CO_AUTHORED_BY}
+      AIDER_ATTRIBUTE_AUTHOR: ${AIDER_ATTRIBUTE_AUTHOR}
+      AIDER_ATTRIBUTE_COMMITTER: ${AIDER_ATTRIBUTE_COMMITTER}
+
+      # Telemetry (PostHog, etc.); disabled by default — see `.env-template`.
+      AIDER_ANALYTICS_DISABLE: ${AIDER_ANALYTICS_DISABLE:-true}
+      AIDER_ANALYTICS: ${AIDER_ANALYTICS:-false}
+
+      AIDER_STREAM: ${AIDER_STREAM:-false}
+      AIDER_FANCY_INPUT: ${AIDER_FANCY_INPUT:-false}
+      AIDER_PRETTY: ${AIDER_PRETTY:-false}
+      AIDER_NOTIFICATIONS: ${AIDER_NOTIFICATIONS:-false}
+      AIDER_THINKING_TOKENS: ${AIDER_THINKING_TOKENS:-0}
+      AIDER_CHAT_LANGUAGE: ${AIDER_CHAT_LANGUAGE:-}
+      AIDER_COMMIT_LANGUAGE: ${AIDER_COMMIT_LANGUAGE:-}
+      AIDER_COMMIT_PROMPT: ${AIDER_COMMIT_PROMPT:-}
+      AIDER_AUTO_COMMITS: ${AIDER_AUTO_COMMITS:-false}
+
+      # Generation parameters (will be used by the agent entrypoint to generate
+      # `/{HOME}/.aider.model.settings.yml` before running Aider).
+      AIDER_OLLAMA_PROVIDER: ${AIDER_OLLAMA_PROVIDER}
+      AIDER_OLLAMA_MODEL: ${AIDER_OLLAMA_MODEL}
+      AIDER_OLLAMA_NUM_CTX: ${AIDER_OLLAMA_NUM_CTX}
+      AIDER_OLLAMA_NUM_PREDICT: ${AIDER_OLLAMA_NUM_PREDICT}
+      AIDER_OLLAMA_TEMPERATURE: ${AIDER_OLLAMA_TEMPERATURE}
+      AIDER_OLLAMA_TOP_P: ${AIDER_OLLAMA_TOP_P}
+      AIDER_OLLAMA_TOP_K: ${AIDER_OLLAMA_TOP_K}
+      AIDER_OLLAMA_REPEAT_PENALTY: ${AIDER_OLLAMA_REPEAT_PENALTY}
+      AIDER_OLLAMA_SEED: ${AIDER_OLLAMA_SEED}
+      AIDER_OLLAMA_KEEP_ALIVE: ${AIDER_OLLAMA_KEEP_ALIVE}
+    volumes:
+      - ${AIDER_WORKSPACES_PATH}:/workspaces:rw
+      - ${AIDER_HOME_PATH}:/app:rw
+
+networks:
+    frontend:
+        driver: bridge
+        ipam:
+            driver: default
+            config:
+                -   subnet: 172.20.0.0/16

@@ -1,0 +1,14 @@
+
+.idea
+.vscode
+.cursor
+.cursorrules
+.cursorignore
+
+.env
+docker-compose.yml
+
+data/agent/app/*
+!data/agent/app/.gitkeep
+data/agent/workspaces/default/*
+!data/agent/workspaces/default/.gitkeep
