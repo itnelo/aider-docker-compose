@@ -15,7 +15,6 @@ Layout:
 ```bash
 cp .env-template .env
 cp docker-compose.dev.yml.dist docker-compose.yml
-docker compose up -d
 ```
 
 ## Run Aider on a repo (`bin/agent`)
